@@ -235,14 +235,25 @@ async function updateTelegramMessage(ctx, text, replyMarkup) {
   const messageId = message?.message_id;
   if (!chatId || !messageId) return;
   const hasMedia = !!(message.photo || message.document || message.video || message.animation || message.audio);
-  if (hasMedia) {
-    return ctx.telegram.editMessageCaption(chatId, messageId, undefined, text, { reply_markup: replyMarkup });
+
+  try {
+    if (hasMedia) {
+      return await ctx.telegram.editMessageCaption(chatId, messageId, undefined, text, { reply_markup: replyMarkup });
+    }
+    return await ctx.telegram.editMessageText(chatId, messageId, undefined, text, { reply_markup: replyMarkup });
+  } catch (error) {
+    const description = error?.response?.description || error?.description || error?.message || '';
+    if (typeof description === 'string' && /message is not modified/i.test(description)) {
+      console.warn('Ignored Telegram edit error: message is not modified');
+      return;
+    }
+    throw error;
   }
-  return ctx.telegram.editMessageText(chatId, messageId, undefined, text, { reply_markup: replyMarkup });
 }
 
 // Telegram Bot Handlers
 bot.on('callback_query', async (ctx) => {
+  let answered = false;
   try {
     console.log('Callback received:', ctx.callbackQuery.data);
     const data = ctx.callbackQuery.data;
@@ -254,62 +265,77 @@ bot.on('callback_query', async (ctx) => {
     const chatId = message?.chat?.id;
     const messageId = message?.message_id;
 
-  if (!chatId || !messageId) {
-    await ctx.answerCbQuery('لا يمكن تحديث الرسالة');
-    return;
-  }
+    if (!chatId || !messageId) {
+      await ctx.answerCbQuery('لا يمكن تحديث الرسالة');
+      answered = true;
+      return;
+    }
 
-  if (!email) {
-    await ctx.answerCbQuery('بيانات غير صالحة');
-    return;
-  }
+    if (!email) {
+      await ctx.answerCbQuery('بيانات غير صالحة');
+      answered = true;
+      return;
+    }
 
-  if (action === 'stop' || action === 'start') {
+    if (action === 'stop' || action === 'start') {
+      const user = db.data.users.find(u => u.email === email);
+      if (!user) {
+        console.log('Callback user not found for stop/start:', email);
+        await ctx.answerCbQuery('المستخدم غير موجود');
+        answered = true;
+        return;
+      }
+
+      if (action === 'stop') {
+        user.status = 'blocked';
+        await db.write();
+        await ctx.answerCbQuery('تم إيقاف المستخدم');
+        answered = true;
+        return updateTelegramMessage(ctx, buildAdminCaption(user, 'stop', `🔴 المستخدم موقوف الآن وسيشاهد الباقات فقط.`), makeControlKeyboard(email));
+      }
+      if (action === 'start') {
+        user.status = 'active';
+        await db.write();
+        await ctx.answerCbQuery('تم تشغيل المستخدم');
+        answered = true;
+        return updateTelegramMessage(ctx, buildAdminCaption(user, 'accept', `🟢 المستخدم مفعل الآن ويمكنه التداول.`), makeControlKeyboard(email));
+      }
+    }
+
     const user = db.data.users.find(u => u.email === email);
     if (!user) {
-      console.log('Callback user not found for stop/start:', email);
-      return ctx.answerCbQuery('المستخدم غير موجود');
+      await ctx.answerCbQuery('المستخدم غير موجود');
+      answered = true;
+      return;
     }
 
-    if (action === 'stop') {
-      user.status = 'blocked';
-      await db.write();
-      await ctx.answerCbQuery('تم إيقاف المستخدم');
-      return updateTelegramMessage(ctx, buildAdminCaption(user, 'stop', `🔴 المستخدم موقوف الآن وسيشاهد الباقات فقط.`), makeControlKeyboard(email));
-    }
-    if (action === 'start') {
+    if (action === 'accept') {
       user.status = 'active';
       await db.write();
-      await ctx.answerCbQuery('تم تشغيل المستخدم');
+      await ctx.answerCbQuery('تم القبول');
+      answered = true;
       return updateTelegramMessage(ctx, buildAdminCaption(user, 'accept', `🟢 المستخدم مفعل الآن ويمكنه التداول.`), makeControlKeyboard(email));
     }
-  }
 
-  const user = db.data.users.find(u => u.email === email);
-  if (!user) return ctx.answerCbQuery('المستخدم غير موجود');
+    if (action === 'reject') {
+      user.status = 'rejected';
+      await db.write();
+      await ctx.answerCbQuery('تم الرفض');
+      answered = true;
+      return updateTelegramMessage(ctx, buildAdminCaption(user, 'reject', `🔴 المستخدم مرفوض ولن يتمكن من المتابعة.`), makeControlKeyboard(email));
+    }
 
-  if (action === 'accept') {
-    user.status = 'active';
-    await db.write();
-    await ctx.answerCbQuery('تم القبول');
-    return updateTelegramMessage(ctx, buildAdminCaption(user, 'accept', `🟢 المستخدم مفعل الآن ويمكنه التداول.`), makeControlKeyboard(email));
-  }
-
-  if (action === 'reject') {
-    user.status = 'rejected';
-    await db.write();
-    await ctx.answerCbQuery('تم الرفض');
-    return updateTelegramMessage(ctx, buildAdminCaption(user, 'reject', `🔴 المستخدم مرفوض ولن يتمكن من المتابعة.`), makeControlKeyboard(email));
-  }
-
-  await ctx.answerCbQuery('الإجراء غير معروف');
-  return;
+    await ctx.answerCbQuery('الإجراء غير معروف');
+    answered = true;
+    return;
   } catch (error) {
     console.error('Callback processing error:', error);
-    try {
-      await ctx.answerCbQuery('حدث خطأ أثناء المعالجة');
-    } catch (e) {
-      console.error('Failed to answer callback:', e);
+    if (!answered) {
+      try {
+        await ctx.answerCbQuery('حدث خطأ أثناء المعالجة');
+      } catch (e) {
+        console.error('Failed to answer callback:', e);
+      }
     }
   }
 });
